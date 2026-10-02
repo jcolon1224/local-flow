@@ -1,82 +1,119 @@
-# Local Flow
+# Local Flow 🎙
 
-A free, private Wispr Flow for your Mac. Speech-to-text runs 100% on-device (Whisper small.en on Apple MLX); cleanup runs on-device too.
+**Free, private voice dictation for your Mac.** Hold a key, talk, let go — your words appear wherever your cursor is, cleaned up and punctuated. Like [Wispr Flow](https://wisprflow.ai), but it runs **entirely on your Mac**: no subscription, no account, and your voice never leaves your computer.
 
-## Using it
+- ⚡ **Fast** — about half a second for a typical dictation (Whisper on Apple's MLX)
+- 🔒 **Private** — speech-to-text and cleanup run on-device; works offline
+- 🧹 **Understands how people talk** — removes "um/uh", applies "Tuesday, no wait, Wednesday", "scratch that", "new paragraph", spoken lists
+- 💬 **Adapts to the app** — casual in Messages/Slack, proper punctuation in Mail/Gmail, safe in Terminal
+- 🛠 **Takes care of itself** — starts at login, restarts if it crashes, recovers the hotkey and mic automatically
+
+> Want to learn how it's built, or build your own version with Claude Code? See **[GUIDE.md](GUIDE.md)** — step-by-step prompts plus every pitfall we hit.
+
+---
+
+## Requirements
+- A Mac with **Apple Silicon** (M1, M2, M3, M4…). Intel Macs aren't supported.
+- macOS 14 Sonoma or newer (tested on macOS 26)
+- ~2 GB free disk space, 8 GB RAM or more
+- An internet connection for the one-time install
+
+## Install (about 5 minutes)
+
+Open **Terminal** (⌘ Space → type "Terminal" → Return) and paste these lines one at a time:
+
+```bash
+git clone https://github.com/jcolon1224/local-flow.git ~/local-flow
+```
+```bash
+cd ~/local-flow && ./install.sh
+```
+
+> **Important:** keep the folder at `~/local-flow` (or anywhere that's *not* Desktop, Documents, Downloads or iCloud Drive). macOS blocks apps from reading those folders and Local Flow would silently quit. The installer checks this for you.
+
+If you don't have `git`, macOS will offer to install the Command Line Tools — click **Install**, wait, then run the line again.
+
+### Grant three permissions (one time)
+macOS will ask, or click 🎙 in the menu bar → **Fix permissions…**. In **System Settings → Privacy & Security**, turn on **Local Flow** under:
+
+1. **Microphone** — to hear you
+2. **Accessibility** — to paste text for you
+3. **Input Monitoring** — to notice the hotkey
+
+Local Flow restarts itself as soon as they're on. The 🎙 icon in the top-right menu bar means it's ready.
+
+## Use it
+
 | Do this | Result |
 |---|---|
-| **Hold Right ⌥ Option**, talk, release | Text is pasted at your cursor |
-| **Double-tap Right ⌥**, talk as long as you like, tap once more | Hands-free mode (icon 🟠) |
-| **Esc** during hands-free | Cancel without pasting |
-| Right ⌥ + another key (e.g. ⌥→) | Works as normal Option — dictation cancels itself |
+| **Hold Right ⌥ Option**, talk, let go | Text appears at your cursor |
+| **Double-tap Right ⌥**, talk as long as you like, tap again | Hands-free mode |
+| **Esc** during hands-free | Cancel |
+| Right ⌥ + another key (e.g. ⌥→) | Works as a normal Option key |
 
-Menu bar icon: 🎙 ready · 🔴 recording · 🟠 hands-free · ⏳ loading/transcribing · ⚠️ needs attention.
+A small pill at the bottom of the screen shows your voice level while recording (red = holding, orange 🔒 = hands-free, dots = transcribing).
 
-While you talk, a **floating pill** appears at the bottom of the screen with live mic levels (red = holding, orange 🔒 = hands-free, dots = transcribing). Turn it off: 🎙 → Floating indicator.
+**Things you can say:**
+- "Let's meet Tuesday, **no wait**, Wednesday" → *Let's meet Wednesday*
+- "…**scratch that**" → deletes the previous sentence
+- "**new line**", "**new paragraph**", "**bullet point**"
+- "Three things: **first** … **second** … **third** …" → a numbered list
+- Your own **snippets**: "my email address" → *you@example.com*
 
-### Per-app styles (🎙 → Per-app styles, edit with 🎙 → Edit app styles)
-| Style | Where | What it does |
-|---|---|---|
-| casual | Messages, Slack, Telegram, WhatsApp, Discord | One-sentence messages drop the trailing period ("sounds good") |
-| formal | Mail, Pages, Word, Outlook, and any window titled Gmail / Google Docs | Capitalized, always ends with punctuation |
-| terminal | Terminal, iTerm, Warp, Ghostty | Never pastes a line break (it could run a half-dictated command), no trailing space |
-| default | Everything else | Unchanged |
-`styles.json` maps app bundle IDs (`apps`) and browser window titles (`window_titles`) to a style.
+## Make it yours (🎙 menu)
 
-### History (🎙 → Search history…)
-Opens a searchable page of every dictation, newest first, with Copy buttons, the app it went to, and the original transcript before cleanup.
+| Menu item | What it's for |
+|---|---|
+| **Search history…** | Every dictation, searchable, with Copy buttons |
+| **Edit dictionary** | Names and jargon to spell right (`words`), and fixes for words it keeps mishearing (`replacements`) |
+| **Edit snippets** | Phrases that expand to text: email, address, calendar link, sign-off |
+| **Edit app styles** | Which apps get casual / formal / terminal style |
+| **Microphone** | Pick a specific mic (default: automatic, skipping silent ones) |
+| Smart cleanup / Per-app styles / Floating indicator / Sounds | On/off switches |
+| **Restart Local Flow** / **Open log** | If anything ever feels off |
 
-### Things it understands (free, on-device)
-- Fillers: "um", "uh", stutters ("the the") are removed
-- Corrections: "Tuesday, no wait, Wednesday" → "Wednesday" (also "actually no", "sorry I mean", "or rather")
-- "scratch that" / "delete that" → removes the sentence before it
-- "new line", "new paragraph", "bullet point"
-- Lists: "three things: first…, second…, third…" → numbered list
-- Snippets and dictionary (below)
+Other settings (hotkey, model, memory) live in `~/local-flow/config.json` (defaults in [config.example.json](config.example.json)); restart after changing. Supported hotkeys: `alt_r` (default), `cmd_r`, `ctrl_r`, `shift_r`, `fn`, `f13`–`f19`.
 
-## App & startup (runs itself — no Terminal, no Claude Code needed)
-- App: `~/Applications/Local Flow.app`. Starts automatically at login (`~/Library/LaunchAgents/com.jordan.localflow.plist`, listed under System Settings → General → Login Items).
-- **Self-healing:**
-  - crashes → restarted automatically within seconds (gives up with a notification after 5 rapid crashes)
-  - macOS disables the hotkey → re-enabled automatically (checked every 3s)
-  - silent mic (iPhone Continuity, Teams/Zoom audio) → switches to the MacBook mic automatically
-  - wake from sleep → mics, hotkey and model refreshed
-  - starts offline (no Wi-Fi needed at login); model kept warm so it stays fast after long idle
-  - missing permission → menu shows ⚠️ and which one; "Fix permissions…" opens the right page
-- If anything ever feels off: 🎙 → **Restart Local Flow**. Still broken? 🎙 → **Open log**.
-- Quit: 🎙 → Quit Local Flow (stays quit until next login or you open it via Spotlight: ⌘ Space → "Local Flow").
-- Project files: `~/local-flow` (shortcut on Desktop). Apps can't read the Desktop folder, which is why it lives here.
-
-### Permissions (System Settings → Privacy & Security)
-Turn on **Local Flow** under **Microphone**, **Input Monitoring**, and **Accessibility**. If it's not listed, click **+**, press ⌘⇧G, type `~/Applications`, and pick Local Flow. Quit and reopen Local Flow after changing permissions.
-
-## Dictionary & snippets (menu → Edit dictionary / Edit snippets)
-- `dictionary.json` → `words`: names/jargon to spell correctly. `replacements`: fix a specific mishearing every time.
-- `snippets.json` → say the trigger phrase, get the expansion — alone ("my email address") or mid-sentence.
-Changes apply on the next dictation; no restart needed.
-
-## Optional: Claude cleanup (paid, ~$0.001/dictation)
-Better at messy rambling than the local rules. Add `ANTHROPIC_API_KEY=...` to `.env`, buy API credits at console.anthropic.com, then menu → "Use Claude Haiku instead". Falls back to local cleanup automatically if it fails.
-
-## Config (`config.json`)
-- `hotkey` — `alt_r` (Right Option), `cmd_r`, `ctrl_r`, `f13`…
-- `model` — `models/whisper-small.en-q8` (default: 8-bit copy, same accuracy, 38% faster, half the memory; rebuild with `.venv/bin/python quantize_model.py 8`) or `mlx-community/whisper-small.en-mlx` (original)
-- `wired_mb` — memory locked for the model so macOS cannot swap it out (0 = off)
-- `sounds`, `local_cleanup`, `claude_cleanup`, `overlay`, `app_styles` — same as the menu toggles
-- `restore_clipboard` — put your previous clipboard (including images) back after pasting
-- `max_minutes` — hands-free safety cap
-
-Changes to config.json need a restart (Quit, reopen).
+### Optional: Claude cleanup (paid)
+The free cleanup handles most things. For messier, rambling speech you can have Claude Haiku tidy the *text* (never the audio) for about $0.001 per dictation: create an API key at [console.anthropic.com](https://console.anthropic.com), add credits, put `ANTHROPIC_API_KEY=sk-ant-…` in `~/local-flow/.env`, restart, and turn on 🎙 → **Use Claude Haiku instead**.
 
 ## Troubleshooting
-- Nothing happens on the hotkey → Input Monitoring / Accessibility not granted to Local Flow.
-- Wrong mic → 🎙 → Microphone → pick one (or "Refresh list" after plugging something in).
-- Log: `local-flow.log`. History of every dictation (raw + cleaned + timings): `history.jsonl`.
-- Debug run in Terminal (quit the app first): `~/local-flow/run.sh`
+
+| Symptom | Fix |
+|---|---|
+| No 🎙 in the menu bar | ⌘ Space → "Local Flow". On notched MacBooks, the icon can hide behind the notch — quit a few other menu bar apps. |
+| ⚠️ instead of 🎙 | Click it — the top line says which permission is missing. Use **Fix permissions…** |
+| Nothing happens when holding the key | Accessibility / Input Monitoring not on for Local Flow. If it's on but still dead, select it, click **–**, then **Fix permissions…** to re-add. |
+| "Didn't catch any speech" | 🎙 → Microphone → pick your mic (iPhone and Teams/Zoom "mics" are often silent) |
+| Slow sometimes | Your Mac is low on memory. Close Chrome tabs or turn on Chrome → Settings → Performance → Memory Saver. |
+| Anything else | 🎙 → **Restart Local Flow**, then 🎙 → **Open log** |
+
+## Update
+```bash
+cd ~/local-flow && git pull && ./install.sh
+```
+Your settings, dictionary, snippets and history are kept.
 
 ## Uninstall
-    launchctl unload ~/Library/LaunchAgents/com.jordan.localflow.plist; rm ~/Library/LaunchAgents/com.jordan.localflow.plist
-    rm -rf ~/Applications/Local\ Flow.app ~/local-flow ~/Desktop/local-flow
+```bash
+~/local-flow/uninstall.sh --all && rm -rf ~/local-flow
+```
 
-## Rebuild the environment
-    cd ~/local-flow && uv venv --python 3.12 .venv && uv pip install --python .venv/bin/python mlx-whisper sounddevice numpy pynput rumps anthropic
+## How it works
+
+| File | Role |
+|---|---|
+| `flow.py` | Menu bar app: recording, the hotkey state machine, transcription queue, paste |
+| `hotkey.py` | Global hotkey via a macOS event tap that re-enables itself if macOS disables it |
+| `rules.py` | Free on-device cleanup (fillers, corrections, lists, spoken formatting) |
+| `cleanup.py` | Snippets, dictionary, optional Claude Haiku pass |
+| `styles.py` | Per-app styles (detects the app and browser tab you're typing into) |
+| `overlay.py` | The floating recording pill |
+| `history_view.py` | Builds the searchable history page |
+| `quantize_model.py` | Makes the 8-bit copy of Whisper small.en |
+| `install.sh` | Builds the Python env, model, `Local Flow.app` and login item |
+
+Speech recognition: OpenAI's [Whisper](https://github.com/openai/whisper) `small.en` via Apple's [MLX](https://github.com/ml-explore/mlx) ([mlx-whisper](https://pypi.org/project/mlx-whisper/)).
+
+## License
+MIT — free to use, change and share. Personal project, not affiliated with Wispr.
