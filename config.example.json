@@ -1,0 +1,14 @@
+{
+  "hotkey": "alt_r",
+  "model": "models/whisper-small.en-q8",
+  "language": "en",
+  "local_cleanup": true,
+  "claude_cleanup": false,
+  "app_styles": true,
+  "overlay": true,
+  "sounds": true,
+  "restore_clipboard": true,
+  "max_minutes": 10,
+  "wired_mb": 450,
+  "microphone": "auto"
+}

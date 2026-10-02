@@ -1,0 +1,6 @@
+{
+  "words": ["Claude", "Anthropic", "Local Flow"],
+  "replacements": {
+    "local flo": "Local Flow"
+  }
+}

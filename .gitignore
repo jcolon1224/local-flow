@@ -1,0 +1,17 @@
+# Your personal data — never commit
+.env
+config.json
+dictionary.json
+snippets.json
+styles.json
+history.jsonl
+history.html
+local-flow.log*
+
+# Generated / large
+.venv/
+models/
+__pycache__/
+.lock
+*.pyc
+.DS_Store

@@ -1,0 +1,14 @@
+# Apple Silicon Mac, Python 3.12 (installed for you by install.sh via uv).
+mlx==0.32.2
+mlx-whisper==0.4.3
+huggingface_hub==2.0.0
+numpy==2.5.3
+sounddevice==0.5.6
+rumps==0.4.0
+pyobjc-core==12.2.2
+pyobjc-framework-Cocoa==12.2.2
+pyobjc-framework-Quartz==12.2.2
+pyobjc-framework-ApplicationServices==12.2.2
+pyobjc-framework-AVFoundation==12.2.2
+# Optional Claude cleanup (paid). Harmless if you never add an API key.
+anthropic==1.8.0
