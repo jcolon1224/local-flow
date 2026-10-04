@@ -51,6 +51,7 @@ class HotkeyTap:
         self._loop = None
         self._thread = None
         self._down = False
+        self._handling_since: float | None = None
         self._callback_ref = self._callback  # keep alive for the C side
         threading.Thread(target=self._dispatch, daemon=True, name="hotkey-dispatch").start()
         self._start_tap()
@@ -118,10 +119,19 @@ class HotkeyTap:
     def _dispatch(self):
         while True:
             kind, key, ts = self.events.get()
+            self._handling_since = time.time()
             try:
                 self.on_event(kind, key, ts)
             except Exception:
                 log.exception("hotkey handler failed")
+            finally:
+                self._handling_since = None
+
+    def stuck_seconds(self) -> float:
+        """How long the current key event has been in its handler (0 if idle).
+        Handlers should take milliseconds; many seconds means something hung."""
+        since = self._handling_since
+        return time.time() - since if since else 0.0
 
     # ----- watchdog (call periodically) -----
 

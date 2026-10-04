@@ -168,27 +168,81 @@ def voiced_seconds(audio: np.ndarray) -> float:
 class Recorder:
     """Records from the chosen mic, falling back to the built-in mic if the
     chosen one delivers nothing (iPhone Continuity mic, Teams/Zoom virtual
-    devices and disconnected headsets often "open" fine but stay silent)."""
+    devices and disconnected headsets often "open" fine but stay silent).
+
+    PortAudio calls that stop or re-scan audio can deadlock inside CoreAudio
+    (seen on the first recording after wake from sleep), so they never run on
+    the caller's thread: they run on helper threads with a timeout, and a hang
+    sets `wedged` so the app can restart itself instead of freezing.
+    """
 
     FALLBACK_AFTER = 0.5  # seconds without any audio before switching mics
+    HANG_TIMEOUT = 3.0    # a PortAudio call slower than this is considered hung
 
     def __init__(self):
         self._chunks: list[np.ndarray] = []
         self._stream = None
         self._lock = threading.Lock()
+        self._capturing = False
+        self._pending: threading.Thread | None = None  # in-flight stop/re-scan
+        self.wedged = False  # audio system hung; the app must restart
         self.device_name = ""
         self.silent_devices: set[str] = set()  # skipped until "Refresh list"
         self.level = 0.0  # current mic loudness, 0..1, for the floating pill
 
+    # ----- guarded PortAudio helpers -----
+
+    def _acquire(self):
+        if not self._lock.acquire(timeout=self.HANG_TIMEOUT):
+            self.wedged = True
+            raise RuntimeError("audio system is not responding")
+
+    def _background(self, fn, what: str):
+        """Run a PortAudio call that may hang, off the caller's thread."""
+        def run():
+            try:
+                fn()
+            except sd.PortAudioError:
+                log.exception(what)
+
+        worker = threading.Thread(target=run, daemon=True, name="audio-" + what)
+        worker.start()
+        self._pending = worker
+
+        def watch():
+            worker.join(self.HANG_TIMEOUT)
+            if worker.is_alive():
+                log.error("audio system hung during %s — the app will restart", what)
+                self.wedged = True
+
+        threading.Thread(target=watch, daemon=True).start()
+
+    def _settle(self, seconds: float) -> bool:
+        """Wait briefly for an in-flight stop/re-scan; False if it's still running."""
+        pending = self._pending
+        if pending is not None and pending.is_alive():
+            pending.join(seconds)
+            return not pending.is_alive()
+        return True
+
+    # ----- recording -----
+
     def start(self):
-        with self._lock:
+        self._acquire()
+        try:
+            if self.wedged or not self._settle(1.0):
+                self.wedged = True
+                raise RuntimeError("audio system is restarting — try again in a few seconds")
             self._chunks = []
+            self._capturing = True
             try:
                 self._open(self._pick())
             except sd.PortAudioError:
                 # Mic list is stale (e.g. AirPods connected/disconnected): reload and retry.
                 refresh_audio_devices()
                 self._open(self._pick())
+        finally:
+            self._lock.release()
         threading.Thread(target=self._verify_audio, daemon=True).start()
 
     def _pick(self) -> int | None:
@@ -210,6 +264,8 @@ class Recorder:
         log.info("recording from %s", self.device_name)
 
     def _on_audio(self, data, *_):
+        if not self._capturing:
+            return
         self._chunks.append(data.copy())
         rms = float(np.sqrt(np.mean(data ** 2)))
         # -55 dB (room noise) .. -15 dB (loud speech) -> 0..1
@@ -217,7 +273,9 @@ class Recorder:
 
     def _verify_audio(self):
         time.sleep(self.FALLBACK_AFTER)
-        with self._lock:
+        if not self._lock.acquire(timeout=self.HANG_TIMEOUT):
+            return
+        try:
             if self._stream is None:
                 return
             # Real mics always pick up some noise; exact zeros mean a virtual or
@@ -230,19 +288,26 @@ class Recorder:
             log.warning("no audio from %s — switching to built-in mic", self.device_name)
             self.silent_devices.add(self.device_name)
             self._close()
+            if not self._settle(1.0):
+                return
             try:
                 self._open(builtin)
             except sd.PortAudioError:
                 log.exception("built-in mic fallback failed")
+        finally:
+            self._lock.release()
 
     def _close(self):
-        if self._stream:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except sd.PortAudioError:
-                log.exception("closing stream")
-            self._stream = None
+        """Detach the stream and stop it in the background (never blocks)."""
+        stream, self._stream = self._stream, None
+        if stream is None:
+            return
+
+        def stop_and_close():
+            stream.stop()
+            stream.close()
+
+        self._background(stop_and_close, "mic stop")
 
     @property
     def active(self) -> bool:
@@ -252,17 +317,36 @@ class Recorder:
         return sum(len(c) for c in self._chunks) / SAMPLE_RATE
 
     def stop(self) -> np.ndarray:
-        with self._lock:
-            self._close()
-            if not self._chunks:
-                return np.zeros(0, dtype=np.float32)
-            return np.concatenate(self._chunks).flatten()
+        """Returns what was captured. The audio is already in memory, so this
+        returns immediately even if the audio system hangs while stopping."""
+        self._capturing = False
+        chunks, self._chunks = self._chunks, []
+        try:
+            self._acquire()
+        except RuntimeError:
+            log.error("recorder lock stuck; returning captured audio anyway")
+        else:
+            try:
+                self._close()
+            finally:
+                self._lock.release()
+        if not chunks:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(chunks).flatten()
+
+    def settled(self) -> bool:
+        """True when no stop/re-scan is in flight (safe to list devices)."""
+        return self._settle(0)
 
     def refresh_devices(self):
-        """Re-scan mics, but never while a recording is open."""
-        with self._lock:
-            if self._stream is None:
-                refresh_audio_devices()
+        """Re-scan mics in the background, but never while recording or mid-stop."""
+        if self.wedged or not self._lock.acquire(timeout=0.2):
+            return
+        try:
+            if self._stream is None and self._settle(0):
+                self._background(refresh_audio_devices, "device re-scan")
+        finally:
+            self._lock.release()
 
 
 def input_devices() -> list[tuple[int, str]]:
@@ -426,6 +510,7 @@ class FlowApp(rumps.App):
         self.handsfree = False
         self.busy = False  # True while any dictation is waiting/transcribing
         self.jobs: queue.Queue = queue.Queue()  # processed in order by one worker
+        self._job_started: float | None = None
         threading.Thread(target=self._worker, daemon=True, name="dictation-worker").start()
         self.press_t = 0.0
         self.last_tap_t = 0.0
@@ -482,6 +567,20 @@ class FlowApp(rumps.App):
     def _status(self, text: str):
         self._status_text = text
 
+    def _self_heal(self, now: float):
+        """Restart instead of staying frozen. Each of these is a state the app
+        can't recover from in-process (e.g. a CoreAudio deadlock)."""
+        reason = None
+        if self.hotkeys.stuck_seconds() > 10:
+            reason = "hotkey handler stuck"
+        elif self._job_started and now - self._job_started > 180:
+            reason = "transcription stuck"
+        elif self.recorder.wedged and not self.recording and not self.busy:
+            reason = "audio system hung"
+        if reason:
+            log.error("self-heal: %s — restarting", reason)
+            restart()
+
     def _pill_tick(self, _):
         if not CONFIG["overlay"]:
             self.pill.hide()
@@ -506,13 +605,15 @@ class FlowApp(rumps.App):
             self._last_perm_check = time.time()
             if not missing_permissions():
                 restart()
-        if self._mics_changed:  # menus must be rebuilt on the main thread
+        # Menus must be rebuilt on the main thread, and not mid re-scan.
+        if self._mics_changed and self.recorder.settled():
             self._mics_changed = False
             self._build_mic_menu()
         now = time.time()
         if now - self._last_watchdog > WATCHDOG_SECONDS:
             self._last_watchdog = now
             self.hotkeys.ensure_healthy()
+            self._self_heal(now)
         if (self.transcriber and not self.recording and not self.busy
                 and now - self._last_warm > KEEP_WARM_SECONDS):
             self._last_warm = now
@@ -623,7 +724,9 @@ class FlowApp(rumps.App):
     def _worker(self):
         while True:
             audio, target = self.jobs.get()
+            self._job_started = time.time()
             self._process(audio, target)
+            self._job_started = None
             self.recorder.refresh_devices()  # pick up phones/headsets that came or went
             self._mics_changed = True
             if self.jobs.empty():
@@ -741,7 +844,11 @@ class FlowApp(rumps.App):
         auto = rumps.MenuItem("Automatic (system default)", callback=self._choose_mic)
         auto.state = current == "auto"
         self.mic_menu.add(auto)
-        for _, name in input_devices():
+        try:
+            devices = input_devices()
+        except sd.PortAudioError:  # device list mid re-scan; next refresh fixes it
+            devices = []
+        for _, name in devices:
             item = rumps.MenuItem(name, callback=self._choose_mic)
             item.state = current == name
             self.mic_menu.add(item)
@@ -757,7 +864,7 @@ class FlowApp(rumps.App):
     def _refresh_mics(self, _):
         self.recorder.silent_devices.clear()
         self.recorder.refresh_devices()
-        self._build_mic_menu()
+        self._mics_changed = True  # rebuilt by _tick once the re-scan settles
 
 
 def single_instance_lock():

@@ -160,6 +160,10 @@ This is the phase where macOS fights back. Every bullet in this prompt is a bug 
 > - If Right Option is pressed together with another key, cancel (it's being
 >   used as a modifier). Double-tap = hands-free mode, tap again to finish,
 >   Esc to cancel.
+> - Never call PortAudio stop/close/re-scan on the hotkey thread — they can
+>   deadlock inside CoreAudio after sleep. Run them on a helper thread with a
+>   3s timeout; if one hangs, finish the dictation, then restart the process.
+>   Also restart if the hotkey handler or a transcription is stuck.
 > - Opt out of App Nap. Refresh mics/hotkey on wake from sleep.
 > - Start fully offline (HF_HUB_OFFLINE=1, download only if the model is missing).
 > - Never touch AppKit UI from background threads — queue UI changes and apply
@@ -303,6 +307,9 @@ Every one of these happened while building this app. Symptom → cause → fix.
 
 #### 15. A dictated "new line" in Terminal runs a command
 **Fix:** a terminal style that turns line breaks into spaces before pasting.
+
+#### 16. The app freezes mid-recording after the Mac wakes from sleep
+**Symptom:** the pill stays red forever and the hotkey does nothing; the log shows "recording from…" with no "recorded" after it. **Cause:** PortAudio's "stop stream" call can deadlock inside macOS's audio system (the stop thread and the audio thread each wait on a lock the other holds). If that call runs on the thread that handles your hotkey, the whole app is stuck. **Fix:** the audio is already in memory when you release the key, so return it immediately and stop/close the stream on a helper thread with a timeout; if it hangs, finish the dictation and then restart the process. Add a watchdog that restarts the app if the hotkey handler or a transcription is ever stuck. Diagnose freezes with `sample <pid> 2` — ask Claude to read which thread is waiting on what.
 
 ---
 
