@@ -38,14 +38,26 @@ Output only the cleaned text: no preamble, quotes, or tags."""
 
 
 def _load(path: Path, default):
+    """A settings file, or `default` if it's missing, damaged, or not an object.
+    Never raises: a bad dictionary.json must not take dictation down with it."""
     try:
-        return json.loads(path.read_text())
-    except (FileNotFoundError, json.JSONDecodeError):
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
         return default
+    return data if isinstance(data, dict) else default
+
+
+def _str_dict(value) -> dict[str, str]:
+    """Only the string->string entries, with non-empty keys."""
+    if not isinstance(value, dict):
+        return {}
+    return {k.strip(): v for k, v in value.items()
+            if isinstance(k, str) and k.strip() and isinstance(v, str)}
 
 
 def dictionary_words() -> list[str]:
-    return _load(DICTIONARY, {}).get("words", [])
+    words = _load(DICTIONARY, {}).get("words", [])
+    return [w for w in words if isinstance(w, str) and w.strip()] if isinstance(words, list) else []
 
 
 def _norm(s: str) -> str:
@@ -54,7 +66,7 @@ def _norm(s: str) -> str:
 
 def _apply_snippets(text: str) -> tuple[str, dict[str, str], bool]:
     """Swap spoken triggers for placeholders. Returns (text, placeholders, whole_match)."""
-    snippets = _load(SNIPPETS, {})
+    snippets = _str_dict(_load(SNIPPETS, {}))
     for trigger, expansion in snippets.items():
         if _norm(text) == _norm(trigger):
             return expansion, {}, True
@@ -69,7 +81,7 @@ def _apply_snippets(text: str) -> tuple[str, dict[str, str], bool]:
 
 
 def _apply_replacements(text: str) -> str:
-    for wrong, right in _load(DICTIONARY, {}).get("replacements", {}).items():
+    for wrong, right in _str_dict(_load(DICTIONARY, {}).get("replacements")).items():
         text = re.sub(r"\b" + re.escape(wrong) + r"\b", right, text, flags=re.I)
     return text
 

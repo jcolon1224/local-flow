@@ -1,5 +1,6 @@
 """Builds a searchable, offline history page from history.jsonl and opens it."""
 import json
+import logging
 import subprocess
 import time
 from pathlib import Path
@@ -99,17 +100,24 @@ render();
 """
 
 
+MAX_ROWS = 3000  # newest dictations shown; keeps the page fast after months of use
+
+
 def build() -> Path:
     rows = []
     if HISTORY.exists():
-        for line in HISTORY.read_text().splitlines():
+        # bytes + "replace": a line torn by a crash mid-write must not break the page
+        for line in HISTORY.read_bytes().decode("utf-8", "replace").splitlines():
             try:
                 d = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(d, dict):
+                continue
             d.setdefault("text", d.get("raw", ""))
             rows.append(d)
     rows.sort(key=lambda d: d.get("ts", 0), reverse=True)
+    rows = rows[:MAX_ROWS]
     data = json.dumps(rows).replace("</", "<\\/")
     generated = time.strftime("%b %-d, %-I:%M %p")
     PAGE.write_text(TEMPLATE.replace("__DATA__", data).replace("__GENERATED__", generated))
@@ -117,7 +125,16 @@ def build() -> Path:
 
 
 def open_history():
-    subprocess.run(["open", str(build())])
+    """Build off the main thread (a big history would beachball the menu), then open."""
+    import threading
+
+    def run():
+        try:
+            subprocess.run(["open", str(build())])
+        except Exception:
+            logging.getLogger("local-flow").exception("building history page")
+
+    threading.Thread(target=run, daemon=True).start()
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ import ctypes.util
 import fcntl
 import json
 import logging
+import logging.handlers
 import os
 import queue
 import sys
@@ -28,15 +29,15 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 import numpy as np
 import rumps
-import sounddevice as sd
-from AppKit import (NSApplication, NSApplicationActivationPolicyAccessory,
-                    NSPasteboard, NSPasteboardItem, NSPasteboardTypeString)
+from AppKit import (NSApplication, NSApplicationActivationPolicyAccessory, NSPasteboard,
+                    NSPasteboardItem, NSPasteboardTypeString, NSRunningApplication, NSWorkspace)
 from ApplicationServices import AXIsProcessTrustedWithOptions, kAXTrustedCheckOptionPrompt
 from AVFoundation import AVCaptureDevice, AVMediaTypeAudio
 from Foundation import (NSActivityLatencyCritical, NSActivityUserInitiatedAllowingIdleSystemSleep,
                         NSProcessInfo)
 import Quartz
 
+from audio import Recorder, input_devices
 from cleanup import DICTIONARY, SNIPPETS, Cleaner, dictionary_words
 from history_view import open_history as open_history_page
 from hotkey import HotkeyTap
@@ -67,7 +68,39 @@ for _name in ("config", "dictionary", "snippets"):
     _path, _example = ROOT / f"{_name}.json", ROOT / f"{_name}.example.json"
     if not _path.exists() and _example.exists():
         _path.write_text(_example.read_text())
-CONFIG = {**DEFAULTS, **json.loads(CONFIG_PATH.read_text())}
+CONFIG_ERROR = None  # shown in the menu if config.json couldn't be used
+
+
+def _load_config() -> dict:
+    """config.json merged over DEFAULTS, tolerating a damaged or hand-edited file:
+    a bad file or a wrong-typed value falls back to the default for that key
+    instead of killing the app before the menu exists."""
+    global CONFIG_ERROR
+    cfg = dict(DEFAULTS)
+    try:
+        user = json.loads(CONFIG_PATH.read_text())
+        if not isinstance(user, dict):
+            raise ValueError("config.json must contain an object")
+    except (OSError, ValueError) as e:
+        CONFIG_ERROR = f"config.json ignored ({type(e).__name__}) — using defaults"
+        return cfg
+    for key, value in user.items():
+        default = DEFAULTS.get(key)
+        if default is None:
+            cfg[key] = value
+        elif isinstance(default, bool):
+            cfg[key] = bool(value)
+        elif isinstance(default, int):
+            try:
+                cfg[key] = int(value)
+            except (TypeError, ValueError):
+                CONFIG_ERROR = f"config.json: {key} must be a number — using {default}"
+        else:
+            cfg[key] = str(value)
+    return cfg
+
+
+CONFIG = _load_config()
 
 SAMPLE_RATE = 16000  # what Whisper expects
 TAP_SECONDS = 0.3  # a press shorter than this is a "tap", not push-to-talk
@@ -80,13 +113,17 @@ HALLUCINATIONS = {"thank you", "thanks for watching", "thank you for watching",
 
 ICON_IDLE, ICON_REC, ICON_HANDSFREE, ICON_BUSY, ICON_WARN = "🎙", "🔴", "🟠", "⏳", "⚠️"
 
-logging.basicConfig(filename=LOG, level=logging.INFO,
-                    format="%(asctime)s %(levelname)s %(message)s")
+_log_handler = logging.handlers.RotatingFileHandler(LOG, maxBytes=2_000_000, backupCount=1)
+_log_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
 log = logging.getLogger("local-flow")
 
 
 def save_config():
-    CONFIG_PATH.write_text(json.dumps(CONFIG, indent=2) + "\n")
+    # Write-then-rename so a crash mid-write can never leave a torn config.json.
+    tmp = CONFIG_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(CONFIG, indent=2) + "\n")
+    os.replace(tmp, CONFIG_PATH)
 
 
 def play(sound: str):
@@ -164,211 +201,7 @@ def voiced_seconds(audio: np.ndarray) -> float:
 
 
 # ---------- recording ----------
-
-class Recorder:
-    """Records from the chosen mic, falling back to the built-in mic if the
-    chosen one delivers nothing (iPhone Continuity mic, Teams/Zoom virtual
-    devices and disconnected headsets often "open" fine but stay silent).
-
-    PortAudio calls that stop or re-scan audio can deadlock inside CoreAudio
-    (seen on the first recording after wake from sleep), so they never run on
-    the caller's thread: they run on helper threads with a timeout, and a hang
-    sets `wedged` so the app can restart itself instead of freezing.
-    """
-
-    FALLBACK_AFTER = 0.5  # seconds without any audio before switching mics
-    HANG_TIMEOUT = 3.0    # a PortAudio call slower than this is considered hung
-
-    def __init__(self):
-        self._chunks: list[np.ndarray] = []
-        self._stream = None
-        self._lock = threading.Lock()
-        self._capturing = False
-        self._pending: threading.Thread | None = None  # in-flight stop/re-scan
-        self.wedged = False  # audio system hung; the app must restart
-        self.device_name = ""
-        self.silent_devices: set[str] = set()  # skipped until "Refresh list"
-        self.level = 0.0  # current mic loudness, 0..1, for the floating pill
-
-    # ----- guarded PortAudio helpers -----
-
-    def _acquire(self):
-        if not self._lock.acquire(timeout=self.HANG_TIMEOUT):
-            self.wedged = True
-            raise RuntimeError("audio system is not responding")
-
-    def _background(self, fn, what: str):
-        """Run a PortAudio call that may hang, off the caller's thread."""
-        def run():
-            try:
-                fn()
-            except sd.PortAudioError:
-                log.exception(what)
-
-        worker = threading.Thread(target=run, daemon=True, name="audio-" + what)
-        worker.start()
-        self._pending = worker
-
-        def watch():
-            worker.join(self.HANG_TIMEOUT)
-            if worker.is_alive():
-                log.error("audio system hung during %s — the app will restart", what)
-                self.wedged = True
-
-        threading.Thread(target=watch, daemon=True).start()
-
-    def _settle(self, seconds: float) -> bool:
-        """Wait briefly for an in-flight stop/re-scan; False if it's still running."""
-        pending = self._pending
-        if pending is not None and pending.is_alive():
-            pending.join(seconds)
-            return not pending.is_alive()
-        return True
-
-    # ----- recording -----
-
-    def start(self):
-        self._acquire()
-        try:
-            if self.wedged or not self._settle(1.0):
-                self.wedged = True
-                raise RuntimeError("audio system is restarting — try again in a few seconds")
-            self._chunks = []
-            self._capturing = True
-            try:
-                self._open(self._pick())
-            except sd.PortAudioError:
-                # Mic list is stale (e.g. AirPods connected/disconnected): reload and retry.
-                refresh_audio_devices()
-                self._open(self._pick())
-        finally:
-            self._lock.release()
-        threading.Thread(target=self._verify_audio, daemon=True).start()
-
-    def _pick(self) -> int | None:
-        device = choose_input_device()
-        info = sd.query_devices(device) if device is not None else sd.query_devices(kind="input")
-        name = info["name"]
-        if name in self.silent_devices:
-            return builtin_mic_index()
-        return device
-
-    def _open(self, device):
-        self._stream = sd.InputStream(
-            device=device, samplerate=SAMPLE_RATE, channels=1, dtype="float32",
-            callback=self._on_audio,
-        )
-        self._stream.start()
-        self.device_name = sd.query_devices(device, kind="input")["name"] if device is not None \
-            else sd.query_devices(kind="input")["name"]
-        log.info("recording from %s", self.device_name)
-
-    def _on_audio(self, data, *_):
-        if not self._capturing:
-            return
-        self._chunks.append(data.copy())
-        rms = float(np.sqrt(np.mean(data ** 2)))
-        # -55 dB (room noise) .. -15 dB (loud speech) -> 0..1
-        self.level = min(1.0, max(0.0, (20 * np.log10(rms + 1e-7) + 55) / 40))
-
-    def _verify_audio(self):
-        time.sleep(self.FALLBACK_AFTER)
-        if not self._lock.acquire(timeout=self.HANG_TIMEOUT):
-            return
-        try:
-            if self._stream is None:
-                return
-            # Real mics always pick up some noise; exact zeros mean a virtual or
-            # idle device (Teams/Zoom audio, a Continuity iPhone that isn't sending).
-            if self._chunks and any(np.any(c) for c in self._chunks):
-                return
-            builtin = builtin_mic_index()
-            if builtin is None or self.device_name == sd.query_devices(builtin)["name"]:
-                return
-            log.warning("no audio from %s — switching to built-in mic", self.device_name)
-            self.silent_devices.add(self.device_name)
-            self._close()
-            if not self._settle(1.0):
-                return
-            try:
-                self._open(builtin)
-            except sd.PortAudioError:
-                log.exception("built-in mic fallback failed")
-        finally:
-            self._lock.release()
-
-    def _close(self):
-        """Detach the stream and stop it in the background (never blocks)."""
-        stream, self._stream = self._stream, None
-        if stream is None:
-            return
-
-        def stop_and_close():
-            stream.stop()
-            stream.close()
-
-        self._background(stop_and_close, "mic stop")
-
-    @property
-    def active(self) -> bool:
-        return self._stream is not None
-
-    def seconds(self) -> float:
-        return sum(len(c) for c in self._chunks) / SAMPLE_RATE
-
-    def stop(self) -> np.ndarray:
-        """Returns what was captured. The audio is already in memory, so this
-        returns immediately even if the audio system hangs while stopping."""
-        self._capturing = False
-        chunks, self._chunks = self._chunks, []
-        try:
-            self._acquire()
-        except RuntimeError:
-            log.error("recorder lock stuck; returning captured audio anyway")
-        else:
-            try:
-                self._close()
-            finally:
-                self._lock.release()
-        if not chunks:
-            return np.zeros(0, dtype=np.float32)
-        return np.concatenate(chunks).flatten()
-
-    def settled(self) -> bool:
-        """True when no stop/re-scan is in flight (safe to list devices)."""
-        return self._settle(0)
-
-    def refresh_devices(self):
-        """Re-scan mics in the background, but never while recording or mid-stop."""
-        if self.wedged or not self._lock.acquire(timeout=0.2):
-            return
-        try:
-            if self._stream is None and self._settle(0):
-                self._background(refresh_audio_devices, "device re-scan")
-        finally:
-            self._lock.release()
-
-
-def input_devices() -> list[tuple[int, str]]:
-    return [(i, d["name"]) for i, d in enumerate(sd.query_devices()) if d["max_input_channels"] > 0]
-
-
-def builtin_mic_index() -> int | None:
-    for i, name in input_devices():
-        if "macbook" in name.lower() or "built-in" in name.lower():
-            return i
-    return None
-
-
-def choose_input_device() -> int | None:
-    """The mic picked in the menu, or None for the system default."""
-    wanted = CONFIG.get("microphone", "auto")
-    if wanted != "auto":
-        for i, name in input_devices():
-            if name == wanted:
-                return i
-        log.warning("mic %r not connected — using system default", wanted)
-    return None
+# See audio.py: AVAudioEngine capture with silent-mic fallback.
 
 
 # ---------- permissions ----------
@@ -403,35 +236,51 @@ def missing_permissions(prompt: bool = False) -> list[str]:
 def restart():
     """Re-exec ourselves: the hotkey listener only works if it starts *after* access is granted."""
     log.info("restarting")
+    front = NSWorkspace.sharedWorkspace().frontmostApplication()
+    if front is not None and front.bundleIdentifier():
+        # rumps activates us on launch; the new process hands focus straight back.
+        os.environ["LOCALFLOW_REACTIVATE"] = str(front.bundleIdentifier())
     os.execv(sys.executable, [sys.executable, str(ROOT / "flow.py")])
-
-
-def refresh_audio_devices():
-    """PortAudio snapshots devices at startup; re-scan to see new mics/headsets."""
-    sd._terminate()
-    sd._initialize()
 
 
 # ---------- output ----------
 
+# Clipboard types worth putting back after a paste. Images and file promises
+# are skipped: snapshotting them is slow and heavy, and re-setting some of them
+# raises inside AppKit.
+RESTORABLE_TYPES = ("public.utf8-plain-text", "public.rtf", "public.html", "public.url",
+                    "public.file-url", "org.chromium.source-url", "com.apple.webarchive")
+RESTORE_MAX_BYTES = 2_000_000
+PASTE_GRACE = 1.0  # seconds the target app gets to read the clipboard before we restore it
+
+
 def _snapshot(pb) -> list[dict]:
     items = []
     for item in pb.pasteboardItems() or []:
-        items.append({t: item.dataForType_(t) for t in item.types()
-                      if item.dataForType_(t) is not None})
+        data = {}
+        for t in item.types():
+            if str(t) in RESTORABLE_TYPES:
+                d = item.dataForType_(t)
+                if d is not None and d.length() <= RESTORE_MAX_BYTES:
+                    data[t] = d
+        if data:
+            items.append(data)
     return items
 
 
 def _restore(pb, items: list[dict]):
-    pb.clearContents()
-    objs = []
-    for data in items:
-        obj = NSPasteboardItem.alloc().init()
-        for t, d in data.items():
-            obj.setData_forType_(d, t)
-        objs.append(obj)
-    if objs:
-        pb.writeObjects_(objs)
+    try:
+        pb.clearContents()
+        objs = []
+        for data in items:
+            obj = NSPasteboardItem.alloc().init()
+            for t, d in data.items():
+                obj.setData_forType_(d, t)
+            objs.append(obj)
+        if objs:
+            pb.writeObjects_(objs)
+    except Exception:
+        log.exception("restoring clipboard")
 
 
 V_KEYCODE = 9  # the physical V key
@@ -460,7 +309,7 @@ def paste(text: str):
     ours = pb.changeCount()
     press_cmd_v()
     if saved is not None:
-        time.sleep(0.5)  # give the target app time to read the clipboard
+        time.sleep(PASTE_GRACE)
         if pb.changeCount() == ours:  # don't clobber something you copied meanwhile
             _restore(pb, saved)
 
@@ -503,14 +352,16 @@ class FlowApp(rumps.App):
         self.pill = RecordingPill()
         self.target = Target("", "", "", "default")
 
-        self.recorder = Recorder()
+        self.recorder = Recorder(preferred=lambda: CONFIG.get("microphone", "auto"))
+        threading.Thread(target=self.recorder.prewarm, daemon=True, name="audio-prewarm").start()
         self.transcriber = None
         self.lock = threading.Lock()
         self.recording = False
         self.handsfree = False
         self.busy = False  # True while any dictation is waiting/transcribing
         self.jobs: queue.Queue = queue.Queue()  # processed in order by one worker
-        self._job_started: float | None = None
+        self._job: tuple[float, float] | None = None  # (started at, audio seconds)
+        self._reactivate_front_app()
         threading.Thread(target=self._worker, daemon=True, name="dictation-worker").start()
         self.press_t = 0.0
         self.last_tap_t = 0.0
@@ -521,6 +372,8 @@ class FlowApp(rumps.App):
         log.info("missing permissions at start: %s (mic status %s)", self.missing or "none",
                  AVCaptureDevice.authorizationStatusForMediaType_(AVMediaTypeAudio))
         self._last_perm_check = time.time()
+        self._want_prompt = False
+        self._restart_when_idle = False
         self._last_watchdog = self._last_warm = time.time()
         # Opt out of App Nap: a throttled background app responds to the hotkey late.
         self._activity = NSProcessInfo.processInfo().beginActivityWithOptions_reason_(
@@ -533,15 +386,17 @@ class FlowApp(rumps.App):
 
     def _load_model(self):
         try:
-            self.transcriber = Transcriber(CONFIG["model"], CONFIG["language"])
+            transcriber = Transcriber(CONFIG["model"], CONFIG["language"])
             try:
-                self.transcriber.warm_up()
+                transcriber.warm_up()
             except Exception:
                 # Model not downloaded yet (first run / changed in config): fetch it.
                 log.info("model not cached — downloading")
+                self._status("Downloading the speech model (one time, ~500 MB)…")
                 import huggingface_hub.constants
                 huggingface_hub.constants.HF_HUB_OFFLINE = False
-                self.transcriber.warm_up()
+                transcriber.warm_up()
+            self.transcriber = transcriber  # only once it's proven to work
             self._set_icon(ICON_IDLE)
             self._show_ready()
             log.info("model ready: %s", CONFIG["model"])
@@ -549,12 +404,25 @@ class FlowApp(rumps.App):
             log.exception("model load failed")
             self._status(f"Model failed to load: {type(e).__name__}")
 
+    def _reactivate_front_app(self):
+        bundle = os.environ.pop("LOCALFLOW_REACTIVATE", "")
+        if not bundle:
+            return
+
+        def give_back():
+            time.sleep(0.3)  # after rumps has activated us
+            for app in NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle):
+                app.activateWithOptions_(0)
+                break
+
+        threading.Thread(target=give_back, daemon=True).start()
+
     def _show_ready(self):
         if self.missing:
             self._status("⚠️ Turn on Local Flow in: " + " & ".join(self.missing))
             self._set_icon(ICON_WARN)
         else:
-            self._status(f"Ready — hold {self._hotkey_name()} to dictate")
+            self._status(CONFIG_ERROR or f"Ready — hold {self._hotkey_name()} to dictate")
 
     def _hotkey_name(self) -> str:
         return {"alt_r": "Right ⌥", "cmd_r": "Right ⌘", "ctrl_r": "Right ⌃"}.get(
@@ -571,15 +439,19 @@ class FlowApp(rumps.App):
         """Restart instead of staying frozen. Each of these is a state the app
         can't recover from in-process (e.g. a CoreAudio deadlock)."""
         reason = None
-        if self.hotkeys.stuck_seconds() > 10:
+        job = self._job  # (started, audio seconds) or None; read once (worker clears it)
+        if self.hotkeys.stuck_seconds() > 15:
             reason = "hotkey handler stuck"
-        elif self._job_started and now - self._job_started > 180:
-            reason = "transcription stuck"
+        elif job and now - job[0] > 60 + 3 * job[1]:
+            reason = f"transcription stuck ({job[1]:.0f}s of audio)"
         elif self.recorder.wedged and not self.recording and not self.busy:
             reason = "audio system hung"
         if reason:
             log.error("self-heal: %s — restarting", reason)
             restart()
+
+    def _idle(self) -> bool:
+        return not self.recording and not self.busy
 
     def _pill_tick(self, _):
         if not CONFIG["overlay"]:
@@ -601,15 +473,21 @@ class FlowApp(rumps.App):
             self.menu[first].title = self._status_text
             self._status_text = None
         # Waiting on permissions: as soon as they're granted, restart to pick them up.
-        if self.missing and time.time() - self._last_perm_check > 2:
+        if self.missing and time.time() - self._last_perm_check > 2 and self._idle():
             self._last_perm_check = time.time()
             if not missing_permissions():
                 restart()
+        if self._want_prompt:  # permission dialogs must come from the main thread
+            self._want_prompt = False
+            self.missing = missing_permissions(prompt=True)
+            self._show_ready()
         # Menus must be rebuilt on the main thread, and not mid re-scan.
         if self._mics_changed and self.recorder.settled():
             self._mics_changed = False
             self._build_mic_menu()
         now = time.time()
+        if self._restart_when_idle and self._idle():
+            restart()
         if now - self._last_watchdog > WATCHDOG_SECONDS:
             self._last_watchdog = now
             self.hotkeys.ensure_healthy()
@@ -620,9 +498,7 @@ class FlowApp(rumps.App):
             threading.Thread(target=self.transcriber.warm_up, daemon=True).start()
         # Safety cap so a forgotten hands-free session doesn't record forever.
         if self.recording and self.recorder.seconds() > CONFIG["max_minutes"] * 60:
-            with self.lock:
-                if self.recording:
-                    self._finish()
+            self.hotkeys.events.put(("press", "cap", now))  # handled on the hotkey thread
 
     # ----- hotkey state machine -----
 
@@ -643,7 +519,11 @@ class FlowApp(rumps.App):
                     self._start(ts)
             return
         with self.lock:
-            if self.recording and not self.handsfree:
+            if key == "cap":
+                if self.recording:
+                    log.info("recording hit the %s-minute cap", CONFIG["max_minutes"])
+                    self._finish()
+            elif self.recording and not self.handsfree:
                 # Hotkey used as a modifier (e.g. Option+arrow) — not dictation.
                 log.info("cancelled: another key pressed with the hotkey")
                 self._cancel(quiet=True)
@@ -688,8 +568,15 @@ class FlowApp(rumps.App):
         self.recording = True
         self.press_t = ts
         self._set_icon(ICON_REC)
-        play("Tink")
+        threading.Thread(target=self._tink_if_still_recording, args=(ts,), daemon=True).start()
         threading.Thread(target=self.transcriber.prefetch, daemon=True).start()
+
+    def _tink_if_still_recording(self, ts: float):
+        """Play the start sound only once this is clearly a hold, so Option+arrow
+        chords and quick taps stay silent."""
+        time.sleep(TAP_SECONDS)
+        if self.recording and self.press_t == ts:
+            play("Tink")
 
     def _cancel(self, quiet: bool = False):
         self.recorder.stop()
@@ -702,13 +589,17 @@ class FlowApp(rumps.App):
         audio = self.recorder.stop()
         log.info("recorded %.1fs", len(audio) / SAMPLE_RATE)
         if len(audio) == 0:
-            # The stream opened but macOS delivered no audio: mic access is blocked.
             self.recording = self.handsfree = False
-            self._set_icon(ICON_WARN)
-            self.missing = missing_permissions(prompt=True)
-            log.warning("no audio received; mic status %s",
-                        AVCaptureDevice.authorizationStatusForMediaType_(AVMediaTypeAudio))
-            self._status("⚠️ No audio — turn on Local Flow in Microphone settings (menu → Fix permissions)")
+            mic = AVCaptureDevice.authorizationStatusForMediaType_(AVMediaTypeAudio)
+            if mic != 3:  # not authorized: the engine ran but macOS fed it nothing
+                log.warning("no audio received; mic status %s", mic)
+                self._set_icon(ICON_WARN)
+                self._want_prompt = True  # _tick shows the macOS prompt from the main thread
+                self._status("⚠️ No audio — turn on Local Flow in Microphone settings (menu → Fix permissions)")
+            else:  # e.g. a Bluetooth mic that takes a moment to start delivering
+                log.info("no audio captured (too short for this mic)")
+                self._set_icon(ICON_IDLE)
+                self._status("Nothing recorded — hold the key a little longer")
             return
         self.recording = self.handsfree = False
         self.busy = True
@@ -724,15 +615,18 @@ class FlowApp(rumps.App):
     def _worker(self):
         while True:
             audio, target = self.jobs.get()
-            self._job_started = time.time()
-            self._process(audio, target)
-            self._job_started = None
-            self.recorder.refresh_devices()  # pick up phones/headsets that came or went
-            self._mics_changed = True
-            if self.jobs.empty():
-                self.busy = False
-                if not self.recording:
-                    self._set_icon(ICON_IDLE)
+            self._job = (time.time(), len(audio) / SAMPLE_RATE)
+            try:
+                self._process(audio, target)
+            except Exception:  # _process catches its own; this keeps the worker alive regardless
+                log.exception("worker")
+            self._job = None
+            self._mics_changed = True  # phones/headsets may have come or gone
+            with self.lock:  # paired with _finish, so a job queued meanwhile isn't marked idle
+                if self.jobs.empty():
+                    self.busy = False
+                    if not self.recording:
+                        self._set_icon(ICON_IDLE)
 
     def _process(self, audio: np.ndarray, target: Target):
         seconds = len(audio) / SAMPLE_RATE
@@ -813,7 +707,6 @@ class FlowApp(rumps.App):
     def on_wake(self):
         """After sleep: mics may have changed and macOS may have dropped the tap."""
         log.info("woke from sleep — refreshing mics, hotkey and model")
-        self.recorder.silent_devices.clear()
         self.recorder.refresh_devices()
         self._mics_changed = True
         self.hotkeys.ensure_healthy()
@@ -825,7 +718,11 @@ class FlowApp(rumps.App):
 
     @rumps.clicked("Restart Local Flow")
     def restart_clicked(self, _):
-        restart()
+        if self._idle():
+            restart()
+        else:
+            self._status("Finishing the current dictation, then restarting…")
+            self._restart_when_idle = True
 
     @rumps.clicked("Fix permissions…")
     def fix_permissions(self, _):
@@ -845,10 +742,11 @@ class FlowApp(rumps.App):
         auto.state = current == "auto"
         self.mic_menu.add(auto)
         try:
-            devices = input_devices()
-        except sd.PortAudioError:  # device list mid re-scan; next refresh fixes it
-            devices = []
-        for _, name in devices:
+            names = [d.name for d in input_devices()]
+        except Exception:
+            log.exception("listing microphones")
+            names = []
+        for name in names:
             item = rumps.MenuItem(name, callback=self._choose_mic)
             item.state = current == name
             self.mic_menu.add(item)
@@ -858,11 +756,11 @@ class FlowApp(rumps.App):
     def _choose_mic(self, item):
         CONFIG["microphone"] = "auto" if item.title.startswith("Automatic") else item.title
         save_config()
+        self.recorder.refresh_devices()
         self._build_mic_menu()
         self._status(f"Mic: {item.title}")
 
     def _refresh_mics(self, _):
-        self.recorder.silent_devices.clear()
         self.recorder.refresh_devices()
         self._mics_changed = True  # rebuilt by _tick once the re-scan settles
 

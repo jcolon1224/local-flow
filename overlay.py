@@ -100,6 +100,8 @@ class RecordingPill:
         mouse = NSEvent.mouseLocation()
         screen = next((s for s in NSScreen.screens() if NSPointInRect(mouse, s.frame())),
                       NSScreen.mainScreen())
+        if screen is None:  # lid closed / display asleep: nowhere to draw
+            return False
         vf = screen.visibleFrame()
         self.panel.setFrameOrigin_(NSMakePoint(
             vf.origin.x + (vf.size.width - WIDTH) / 2, vf.origin.y + BOTTOM_MARGIN))
@@ -110,7 +112,8 @@ class RecordingPill:
             self.view.setNeedsDisplay_(True)
         if not self.visible:
             self.view.levels.extend([0.0] * BARS)
-            self._place()
+            if self._place() is False:
+                return
             self.panel.orderFrontRegardless()
             self.visible = True
 

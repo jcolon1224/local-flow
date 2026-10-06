@@ -2,11 +2,11 @@
 
 **Free, private voice dictation for your Mac.** Hold a key, talk, let go — your words appear wherever your cursor is, cleaned up and punctuated. Like [Wispr Flow](https://wisprflow.ai), but it runs **entirely on your Mac**: no subscription, no account, and your voice never leaves your computer.
 
-- ⚡ **Fast** — about half a second for a typical dictation (Whisper on Apple's MLX)
+- ⚡ **Fast** — recording starts in ~50 ms, transcription takes about half a second (Whisper on Apple's MLX)
 - 🔒 **Private** — speech-to-text and cleanup run on-device; works offline
 - 🧹 **Understands how people talk** — removes "um/uh", applies "Tuesday, no wait, Wednesday", "scratch that", "new paragraph", spoken lists
 - 💬 **Adapts to the app** — casual in Messages/Slack, proper punctuation in Mail/Gmail, safe in Terminal
-- 🛠 **Takes care of itself** — starts at login, restarts if it crashes, recovers the hotkey and mic automatically
+- 🛠 **Takes care of itself** — starts at login, restarts if it crashes, recovers the hotkey and mic automatically, survives damaged settings files, and never freezes on a hung audio system
 
 > Want to learn how it's built, or build your own version with Claude Code? See **[GUIDE.md](GUIDE.md)** — step-by-step prompts plus every pitfall we hit.
 
@@ -104,6 +104,7 @@ Your settings, dictionary, snippets and history are kept.
 | File | Role |
 |---|---|
 | `flow.py` | Menu bar app: recording, the hotkey state machine, transcription queue, paste |
+| `audio.py` | Microphone capture on Apple's AVAudioEngine, mic list via CoreAudio, silent-mic fallback |
 | `hotkey.py` | Global hotkey via a macOS event tap that re-enables itself if macOS disables it |
 | `rules.py` | Free on-device cleanup (fillers, corrections, lists, spoken formatting) |
 | `cleanup.py` | Snippets, dictionary, optional Claude Haiku pass |

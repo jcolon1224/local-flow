@@ -2,7 +2,7 @@
 
 A step-by-step guide to building a free, private, Wispr Flow–style dictation app for your Mac — by prompting [Claude Code](https://claude.com/claude-code), not by writing code yourself.
 
-This guide comes from building the app in this repo over a few days. Most of that time went into debugging problems that macOS throws at you, so the most valuable part here is **[The Pitfalls](#the-pitfalls-read-this-first)**: give it to Claude up front and you skip the days of debugging.
+This guide comes from building the app in this repo over a few days. Most of that time went into debugging problems that macOS throws at you, so the most valuable part here is **[The Pitfalls](#the-pitfalls-read-this-first)** (22 of them): give it to Claude up front and you skip the days of debugging.
 
 > **Just want the app?** You don't need this guide. Follow the [README](README.md) install instead — it takes 5 minutes.
 
@@ -64,8 +64,14 @@ This guide comes from building the app in this repo over a few days. Most of tha
 >
 > - Menu bar app in Python (rumps) that shows 🎙 when ready, 🔴 while recording,
 >   ⏳ while transcribing.
-> - Hold Right Option to record from the mic (16 kHz mono, sounddevice);
->   release to transcribe with Whisper running locally via mlx-whisper.
+> - Hold Right Option to record from the mic; release to transcribe with
+>   Whisper running locally via mlx-whisper (it wants 16 kHz mono float32).
+> - Record with Apple's AVAudioEngine through PyObjC (an input-node tap), NOT
+>   sounddevice/PortAudio — PortAudio's stop call deadlocks inside CoreAudio on
+>   recent macOS. List and select mics through CoreAudio (ctypes:
+>   AudioObjectGetPropertyData for the device list, AudioUnitSetProperty
+>   kAudioOutputUnitProperty_CurrentDevice on the input node's audio unit).
+>   Resample to 16 kHz with scipy.signal.resample_poly.
 > - Paste the result at my cursor: put it on the clipboard, press ⌘V by posting
 >   Quartz CGEvents (NOT pynput's keyboard Controller), then restore my previous
 >   clipboard — all types, including images — unless I copied something new
@@ -160,10 +166,13 @@ This is the phase where macOS fights back. Every bullet in this prompt is a bug 
 > - If Right Option is pressed together with another key, cancel (it's being
 >   used as a modifier). Double-tap = hands-free mode, tap again to finish,
 >   Esc to cancel.
-> - Never call PortAudio stop/close/re-scan on the hotkey thread — they can
->   deadlock inside CoreAudio after sleep. Run them on a helper thread with a
->   3s timeout; if one hangs, finish the dictation, then restart the process.
->   Also restart if the hotkey handler or a transcription is stuck.
+> - Stop the audio engine on a helper thread with a 3s timeout, never on the
+>   hotkey thread; the captured audio is already in memory, so return it
+>   immediately. If the stop ever hangs, finish the dictation, then restart
+>   the process. Also restart if the hotkey handler or a transcription is stuck.
+> - Pre-build the next AVAudioEngine (init, select device, install tap,
+>   prepare) in the background after each recording, so a key press only has
+>   to call start (~50 ms instead of ~250 ms, which would clip the first word).
 > - Opt out of App Nap. Refresh mics/hotkey on wake from sleep.
 > - Start fully offline (HF_HUB_OFFLINE=1, download only if the model is missing).
 > - Never touch AppKit UI from background threads — queue UI changes and apply
@@ -308,8 +317,26 @@ Every one of these happened while building this app. Symptom → cause → fix.
 #### 15. A dictated "new line" in Terminal runs a command
 **Fix:** a terminal style that turns line breaks into spaces before pasting.
 
-#### 16. The app freezes mid-recording after the Mac wakes from sleep
-**Symptom:** the pill stays red forever and the hotkey does nothing; the log shows "recording from…" with no "recorded" after it. **Cause:** PortAudio's "stop stream" call can deadlock inside macOS's audio system (the stop thread and the audio thread each wait on a lock the other holds). If that call runs on the thread that handles your hotkey, the whole app is stuck. **Fix:** the audio is already in memory when you release the key, so return it immediately and stop/close the stream on a helper thread with a timeout; if it hangs, finish the dictation and then restart the process. Add a watchdog that restarts the app if the hotkey handler or a transcription is ever stuck. Diagnose freezes with `sample <pid> 2` — ask Claude to read which thread is waiting on what.
+#### 16. Recording freezes or the app restarts right after a dictation (PortAudio)
+**Symptom:** the pill stays red forever and the hotkey does nothing — or, once a watchdog is in place, the app restarts itself every few dictations. The log shows "recording from…" with no "recorded" after it. **Cause:** `sounddevice`/PortAudio's stop-stream call deadlocks inside macOS's audio system (its stop thread and the audio I/O thread each wait on a lock the other holds). It happened on the first recording after wake and then every few dictations. **Fix:** don't use PortAudio on macOS at all. Record with AVAudioEngine through PyObjC (stop takes ~10 ms), list and pick mics through CoreAudio directly, and keep the "stop on a helper thread with a timeout + restart if it hangs" guard anyway as insurance. Diagnose freezes with `sample <pid> 2` — ask Claude to read which thread is waiting on what.
+
+#### 17. The first word of a dictation gets clipped
+**Cause:** creating an AVAudioEngine costs 100-250 ms, so recording starts after you've begun talking. **Fix:** pre-build and `prepare()` the next engine in the background right after each recording (a prepared engine doesn't hold the mic open — the orange dot stays off), so a key press only calls `start` (~50 ms).
+
+#### 18. A hand-edited settings file takes the whole app down
+**Symptom:** after editing config.json (a stray comma, `"max_minutes": "10"` in quotes) the app crash-loops at launch and the launcher gives up. **Fix:** load settings defensively — a damaged file or a wrong-typed value falls back to the default for that key and shows a message in the menu; write settings via temp-file + rename so a crash can't leave a torn file; validate dictionary/snippets/styles shapes and skip bad entries.
+
+#### 19. Pasting into a slow app pastes your *old* clipboard
+**Cause:** you put the text on the clipboard, press ⌘V, then restore the previous clipboard — but Electron apps (Slack, Discord, VS Code) sometimes read the clipboard more than half a second later. **Fix:** give the app a full second before restoring, only restore text-like types (images and file promises are slow and can throw), and never let the restore raise.
+
+#### 20. A frozen app in front stalls every dictation
+**Cause:** reading the frontmost window's title (for per-app styles) goes through Accessibility, which waits up to 6 s per call for an unresponsive app. **Fix:** `AXUIElementSetMessagingTimeout(app, 0.5)`, and never do this work on the main thread.
+
+#### 21. The app steals focus every time it restarts
+**Cause:** rumps activates the app on launch, so each self-heal restart deactivates whatever you were typing in. **Fix:** remember the frontmost app's bundle id before `execv`, pass it through the environment, and re-activate it right after start.
+
+#### 22. Reinstalling silently loses the permissions
+**Cause:** macOS files Microphone/Accessibility/Input Monitoring grants under the app's bundle identifier; an installer that generates a new id (or leaves two login items) revokes them. **Fix:** read and keep the bundle id of an existing install, write the bundle only when its contents changed, and remove login items left by older versions.
 
 ---
 

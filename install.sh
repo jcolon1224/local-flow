@@ -15,7 +15,10 @@ DIR="$(pwd -P)"
 APP="${LOCALFLOW_APP:-$HOME/Applications/Local Flow.app}"
 TEST_MODE="${LOCALFLOW_TEST:-0}"  # 1 = build only: don't touch the running app or login items
 USER_ID="$(id -un | tr -cd 'a-zA-Z0-9')"
-BUNDLE_ID="com.localflow.${USER_ID:-user}"
+# Keep the bundle id of an existing install: macOS files Microphone/Accessibility/
+# Input Monitoring permissions under it, and changing it would revoke them.
+BUNDLE_ID="$(defaults read "$APP/Contents/Info" CFBundleIdentifier 2>/dev/null || true)"
+[[ -n "$BUNDLE_ID" ]] || BUNDLE_ID="com.localflow.${USER_ID:-user}"
 AGENT="$HOME/Library/LaunchAgents/$BUNDLE_ID.plist"
 
 step() { print -P "\n%F{cyan}==>%f %B$1%b"; }
@@ -67,13 +70,11 @@ fi
 
 # ---------------------------------------------------------------- 4. app
 step "Building Local Flow.app"
-if [[ "$TEST_MODE" != 1 ]]; then
-  pkill -f "$DIR/flow.py" 2>/dev/null || true
-  pkill -f "Local Flow.app/Contents/MacOS/LocalFlow" 2>/dev/null || true
-fi
-rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$HOME/Library/LaunchAgents"
-cat > "$APP/Contents/Info.plist" <<PLIST
+# Build into a staging folder, then replace the real app only if something changed:
+# re-signing an unchanged bundle is pointless and every change risks a permission re-prompt.
+STAGE="$(mktemp -d "${TMPDIR:-/tmp}/localflow.XXXXXX")/Local Flow.app"
+mkdir -p "$STAGE/Contents/MacOS" "$HOME/Library/LaunchAgents"
+cat > "$STAGE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -94,8 +95,9 @@ PLIST
 
 # The launcher keeps Python as a *child* process (not exec) so macOS files the
 # Microphone / Accessibility / Input Monitoring permissions under "Local Flow",
-# and restarts it if it crashes. Quitting from the menu (exit 0) really quits.
-cat > "$APP/Contents/MacOS/LocalFlow" <<LAUNCHER
+# and restarts it if it crashes — with a backoff, never giving up for good.
+# Quitting from the menu (exit 0) really quits.
+cat > "$STAGE/Contents/MacOS/LocalFlow" <<LAUNCHER
 #!/bin/zsh
 DIR="$DIR"
 LOG="\$DIR/local-flow.log"
@@ -105,6 +107,7 @@ CHILD=""
 trap '[ -n "\$CHILD" ] && kill \$CHILD 2>/dev/null; exit 0' TERM INT
 [ -f "\$LOG" ] && [ \$(stat -f%z "\$LOG") -gt 2000000 ] && mv "\$LOG" "\$LOG.old"
 quick_crashes=0
+notified=0
 while true; do
   started=\$(date +%s)
   "\$DIR/.venv/bin/python" "\$DIR/flow.py" >> "\$LOG" 2>&1 &
@@ -113,17 +116,33 @@ while true; do
   code=\$?
   [ \$code -eq 0 ] && exit 0
   echo "\$(date '+%F %T') launcher: Local Flow exited (code \$code) — restarting" >> "\$LOG"
-  if (( \$(date +%s) - started < 30 )); then quick_crashes=\$((quick_crashes + 1)); else quick_crashes=0; fi
-  if (( quick_crashes >= 5 )); then
-    osascript -e 'display notification "Local Flow keeps crashing. See local-flow.log" with title "Local Flow stopped"'
-    exit 1
+  # Crashes right after start count up; a run that lasted a while resets the count.
+  if (( \$(date +%s) - started < 60 )); then quick_crashes=\$((quick_crashes + 1)); else quick_crashes=0; notified=0; fi
+  if (( quick_crashes >= 5 && notified == 0 )); then
+    osascript -e 'display notification "Local Flow keeps crashing; retrying every minute. See 🎙 → Open log." with title "Local Flow"' 2>/dev/null
+    notified=1
   fi
-  sleep \$((2 + quick_crashes * 5))
+  delay=\$((2 * quick_crashes * quick_crashes))   # 0, 2, 8, 18, 32, 50…
+  (( delay > 60 )) && delay=60
+  sleep \$delay
 done
 LAUNCHER
-chmod +x "$APP/Contents/MacOS/LocalFlow"
-codesign --force --deep -s - "$APP" >/dev/null 2>&1
-ok "Built $APP"
+chmod +x "$STAGE/Contents/MacOS/LocalFlow"
+if [[ -d "$APP" ]] && cmp -s "$STAGE/Contents/Info.plist" "$APP/Contents/Info.plist" \
+   && cmp -s "$STAGE/Contents/MacOS/LocalFlow" "$APP/Contents/MacOS/LocalFlow"; then
+  rm -rf "$(dirname "$STAGE")"
+  ok "$APP is already up to date"
+else
+  if [[ "$TEST_MODE" != 1 ]]; then
+    pkill -f "$DIR/flow.py" 2>/dev/null || true
+    pkill -f "Local Flow.app/Contents/MacOS/LocalFlow" 2>/dev/null || true
+  fi
+  codesign --force --deep -s - "$STAGE" >/dev/null 2>&1
+  rm -rf "$APP"
+  mv "$STAGE" "$APP"
+  rm -rf "$(dirname "$STAGE")"
+  ok "Built $APP"
+fi
 
 if [[ "$TEST_MODE" == 1 ]]; then
   ok "Test mode: skipping login item and launch"
@@ -132,6 +151,12 @@ fi
 
 # ---------------------------------------------------------------- 5. login
 step "Starting at login"
+# One login item only: remove agents left by older installs under other names.
+for old in "$HOME"/Library/LaunchAgents/*localflow*.plist(N); do
+  [[ "$old" == "$AGENT" ]] && continue
+  launchctl bootout "gui/$(id -u)" "$old" 2>/dev/null || true
+  rm -f "$old"
+done
 cat > "$AGENT" <<AGENTPLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -146,8 +171,12 @@ cat > "$AGENT" <<AGENTPLIST
 AGENTPLIST
 ok "Login item installed (System Settings → General → Login Items)"
 
-open "$APP"
-ok "Local Flow is starting — look for 🎙 in the menu bar (top-right)"
+if pgrep -f "$DIR/flow.py" >/dev/null; then
+  ok "Local Flow is already running — restart it from 🎙 → Restart Local Flow to pick up changes"
+else
+  open "$APP"
+  ok "Local Flow is starting — look for 🎙 in the menu bar (top-right)"
+fi
 
 cat <<'DONE'
 

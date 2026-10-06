@@ -52,6 +52,8 @@ class HotkeyTap:
         self._thread = None
         self._down = False
         self._handling_since: float | None = None
+        self._rebuild_backoff = 3.0  # seconds; doubles up to a minute while taps keep failing
+        self._next_rebuild = 0.0
         self._callback_ref = self._callback  # keep alive for the C side
         threading.Thread(target=self._dispatch, daemon=True, name="hotkey-dispatch").start()
         self._start_tap()
@@ -62,7 +64,7 @@ class HotkeyTap:
         ready = threading.Event()
         self._thread = threading.Thread(target=self._run, args=(ready,), daemon=True, name="hotkey-tap")
         self._thread.start()
-        ready.wait(5)
+        ready.wait(0.5)
 
     def _run(self, ready: threading.Event):
         mask = (Q.CGEventMaskBit(Q.kCGEventKeyDown) | Q.CGEventMaskBit(Q.kCGEventKeyUp)
@@ -101,8 +103,9 @@ class HotkeyTap:
             elif etype == Q.kCGEventKeyDown:
                 if self.flag is None and code == self.keycode:
                     self._set_down(True, now)
-                elif not Q.CGEventGetIntegerValueField(event, Q.kCGKeyboardEventAutorepeat):
-                    self.events.put(("press", "esc" if code == ESC else "other", now))
+                elif code == ESC or self._down:
+                    if not Q.CGEventGetIntegerValueField(event, Q.kCGKeyboardEventAutorepeat):
+                        self.events.put(("press", "esc" if code == ESC else "other", now))
             elif etype == Q.kCGEventKeyUp and self.flag is None and code == self.keycode:
                 self._set_down(False, now)
         except Exception:
@@ -138,11 +141,18 @@ class HotkeyTap:
     def ensure_healthy(self):
         if self._tap is not None and self._thread.is_alive():
             if Q.CGEventTapIsEnabled(self._tap):
+                self._rebuild_backoff = 3.0
+                self._resync_down()
                 return
             log.warning("hotkey tap found disabled — re-enabling")
             Q.CGEventTapEnable(self._tap, True)
             if Q.CGEventTapIsEnabled(self._tap):
                 return
+        now = time.time()
+        if now < self._next_rebuild:  # don't hammer (and log-spam) while permissions are missing
+            return
+        self._next_rebuild = now + self._rebuild_backoff
+        self._rebuild_backoff = min(self._rebuild_backoff * 2, 60.0)
         log.warning("rebuilding hotkey tap")
         if self._loop is not None:
             Q.CFRunLoopStop(self._loop)
@@ -151,3 +161,13 @@ class HotkeyTap:
         self._tap = self._loop = None
         self._down = False
         self._start_tap()
+
+    def _resync_down(self):
+        """If the key-up was lost (tap disabled mid-press, sleep while holding),
+        our idea of 'held' drifts from reality: fix it from the live flag state."""
+        if self.flag is None or not self._down:
+            return
+        flags = Q.CGEventSourceFlagsState(Q.kCGEventSourceStateCombinedSessionState)
+        if not flags & self.flag:
+            log.info("hotkey release was missed — synthesizing it")
+            self._set_down(False, time.time())

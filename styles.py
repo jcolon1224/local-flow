@@ -17,7 +17,10 @@ from pathlib import Path
 
 from AppKit import NSWorkspace
 from ApplicationServices import (AXUIElementCopyAttributeValue, AXUIElementCreateApplication,
-                                 kAXFocusedWindowAttribute, kAXTitleAttribute)
+                                 AXUIElementSetMessagingTimeout, kAXFocusedWindowAttribute,
+                                 kAXTitleAttribute)
+
+AX_TIMEOUT = 0.5  # seconds; an unresponsive app must not stall the dictation
 
 STYLES_PATH = Path(__file__).parent / "styles.json"
 
@@ -61,14 +64,22 @@ def load_styles() -> dict:
     if not STYLES_PATH.exists():
         STYLES_PATH.write_text(json.dumps(DEFAULT_STYLES, indent=2) + "\n")
     try:
-        return {**DEFAULT_STYLES, **json.loads(STYLES_PATH.read_text())}
-    except json.JSONDecodeError:
+        user = json.loads(STYLES_PATH.read_text())
+    except (OSError, ValueError):
         return DEFAULT_STYLES
+    if not isinstance(user, dict):
+        return DEFAULT_STYLES
+    cfg = {**DEFAULT_STYLES, **user}
+    for section in ("apps", "window_titles"):  # tolerate a damaged section
+        if not isinstance(cfg.get(section), dict):
+            cfg[section] = DEFAULT_STYLES[section]
+    return cfg
 
 
 def _window_title(pid: int) -> str:
     """Focused window title via Accessibility (no Screen Recording permission needed)."""
     app = AXUIElementCreateApplication(pid)
+    AXUIElementSetMessagingTimeout(app, AX_TIMEOUT)
     err, window = AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute, None)
     if err or window is None:
         return ""
@@ -93,9 +104,11 @@ def current_target(styles_on: bool = True) -> Target:
         style = cfg["apps"].get(bundle_id, "default")
         if style == "default":
             for needle, s in cfg["window_titles"].items():
-                if needle.lower() in title.lower():
+                if isinstance(needle, str) and needle.lower() in title.lower():
                     style = s
                     break
+        if style not in ("casual", "formal", "terminal"):
+            style = "default"
     return Target(bundle_id, name, title, style)
 
 
